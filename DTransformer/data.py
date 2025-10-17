@@ -14,32 +14,35 @@ class Batch:
         self.field_index = {f: i for i, f in enumerate(fields)}
         self.seq_len = seq_len
 
-    def get(self, *fields):
-        L = len(self.data[0])
-        return (
-            [self.data[self.field_index[f]] for f in fields]
-            if self.seq_len is None
-            else [
-                [
-                    self.data[self.field_index[f]][
-                        :, i * self.seq_len : (i + 1) * self.seq_len
-                    ]
-                    for i in range(math.ceil(L / self.seq_len))
-                ]
-                for f in fields
-            ]
-        )
+    def get(self, field):
+        """获取单个字段的数据，返回张量"""
+        if field not in self.field_index:
+            return None
+
+        tensor_data = self.data[self.field_index[field]]
+
+        # 如果没有seq_len，直接返回
+        if self.seq_len is None:
+            return tensor_data
+
+        # 如果有seq_len，需要分割序列
+        L = tensor_data.shape[1]
+        chunks = []
+        for i in range(math.ceil(L / self.seq_len)):
+            chunk = tensor_data[:, i * self.seq_len: (i + 1) * self.seq_len]
+            chunks.append(chunk)
+        return chunks  # 返回分块列表
 
 
 class KTData:
     def __init__(
-        self,
-        data_path,
-        inputs,
-        batch_size=1,
-        seq_len=None,
-        shuffle=False,
-        num_workers=0,
+            self,
+            data_path,
+            inputs,
+            batch_size=1,
+            seq_len=None,
+            shuffle=False,
+            num_workers=0,
     ):
         self.data = Lines(data_path, group=len(inputs) + 1)
         self.loader = DataLoader(
@@ -59,37 +62,60 @@ class KTData:
         return len(self.data)
 
     def __getitem__(self, index):
-        return Batch(
-            torch.tensor(
-                [
-                    [int(x) for x in line.strip().split(",")]
-                    for line in self.data[index][1:]
-                ]
-            ),
-            self.inputs,
-            self.seq_len,
-        )
+        """返回单个样本的Batch对象"""
+        # 读取数据行，跳过第一行（可能是header）
+        lines = self.data[index][1:]
+
+        # 将每一行转换为整数列表（不使用torch.tensor，因为长度可能不同）
+        parsed_data = []
+        for line in lines:
+            try:
+                values = [int(x) for x in line.strip().split(",")]
+                parsed_data.append(values)
+            except ValueError as e:
+                print(f"Error parsing line: {line}")
+                raise e
+
+        # 转换为张量列表（每个字段一个张量）
+        tensors = []
+        for field_data in parsed_data:
+            tensors.append(torch.tensor(field_data, dtype=torch.long))
+
+        return Batch(tensors, self.inputs, self.seq_len)
 
 
 def transform_batch(batch):
-    # collect data
-    batch_data = [b.data for b in batch]
-    # merge configs
-    fields, seq_len = batch[0].fields, batch[0].seq_len
+    """
+    合并多个样本为一个batch
+    batch: list of Batch objects
+    """
+    if len(batch) == 0:
+        return None
 
-    # transpose to separate sequences
-    batch = list(zip(*batch_data))
-    # pad sequences
-    batch = [
-        torch.nn.utils.rnn.pad_sequence(
-            seqs,
+    # 获取配置
+    fields = batch[0].fields
+    seq_len = batch[0].seq_len
+
+    # 收集每个字段的所有序列
+    num_fields = len(fields)
+    field_sequences = [[] for _ in range(num_fields)]
+
+    for b in batch:
+        for i, tensor in enumerate(b.data):
+            field_sequences[i].append(tensor)
+
+    # 对每个字段的序列进行填充
+    padded_tensors = []
+    for sequences in field_sequences:
+        # 使用 pad_sequence 填充到相同长度
+        padded = torch.nn.utils.rnn.pad_sequence(
+            sequences,
             batch_first=True,
             padding_value=-1,
         )
-        for seqs in batch
-    ]
+        padded_tensors.append(padded)
 
-    return Batch(batch, fields, seq_len)
+    return Batch(padded_tensors, fields, seq_len)
 
 
 class Lines:
